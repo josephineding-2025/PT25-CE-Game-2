@@ -14,6 +14,14 @@ pose = mp_pose.Pose(
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
+# Initialize MediaPipe Hands
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
 class MotionGame:
     def __init__(self):
@@ -23,6 +31,10 @@ class MotionGame:
         self.timer_start = None
         self.total_score = 0
         self.game_over = False
+        self.game_over = False
+        self.game_started = False
+        self.countdown_active = False
+        self.countdown_start = None
         self.start_game_time = time.time()
         
         # Define poses
@@ -40,6 +52,65 @@ class MotionGame:
         self.current_pose = self.pose_definitions[0]
         self.shuffle_order = [] 
 
+    def start_game(self):
+        """Starts the game."""
+        self.game_started = True
+        self.countdown_active = False
+        self.timer_start = time.time()
+        
+    def trigger_countdown(self):
+        """Starts the countdown."""
+        self.countdown_active = True
+        self.countdown_start = time.time()
+
+    def update_countdown(self):
+        """Returns countdown text (3..2..1) or starts game."""
+        elapsed = time.time() - self.countdown_start
+        if elapsed < 1: return "3"
+        elif elapsed < 2: return "2"
+        elif elapsed < 3: return "1"
+        else:
+            self.start_game()
+            return "GO!"
+
+    def is_fist(self, hand_landmarks):
+        """Checks if a hand is a fist."""
+        tips = [mp_hands.HandLandmark.INDEX_FINGER_TIP, mp_hands.HandLandmark.MIDDLE_FINGER_TIP, 
+                mp_hands.HandLandmark.RING_FINGER_TIP, mp_hands.HandLandmark.PINKY_TIP]
+        pips = [mp_hands.HandLandmark.INDEX_FINGER_PIP, mp_hands.HandLandmark.MIDDLE_FINGER_PIP, 
+                mp_hands.HandLandmark.RING_FINGER_PIP, mp_hands.HandLandmark.PINKY_PIP]
+        
+        fist_count = 0
+        wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
+        
+        # Check if tips are closer to wrist than PIP joints
+        for tip, pip in zip(tips, pips):
+            t = hand_landmarks.landmark[tip]
+            p = hand_landmarks.landmark[pip]
+            dist_tip = math.sqrt((t.x - wrist.x)**2 + (t.y - wrist.y)**2)
+            dist_pip = math.sqrt((p.x - wrist.x)**2 + (p.y - wrist.y)**2)
+            if dist_tip < dist_pip: # Folded
+                fist_count += 1
+                
+        return fist_count >= 3 # At least 3 fingers folded
+
+    def check_hands_start(self, hand_results):
+        """Checks for two fists to start countdown."""
+        if not hand_results.multi_hand_landmarks: return False
+        
+        # Need 2 hands
+        if len(hand_results.multi_hand_landmarks) < 2: return False
+        
+        # Check if BOTH are fists
+        fists = 0
+        for hand_lms in hand_results.multi_hand_landmarks:
+            if self.is_fist(hand_lms):
+                fists += 1
+                
+        if fists == 2:
+            return True
+        return False
+
     def reset_game(self):
         """Resets the game state to start over."""
         self.stage = 1
@@ -49,6 +120,8 @@ class MotionGame:
         self.total_score = 0
         self.game_over = False
         self.current_pose = self.pose_definitions[0]
+        self.current_pose = self.pose_definitions[0]
+        self.countdown_active = False
         self.start_game_time = time.time()
  
 
@@ -71,9 +144,11 @@ class MotionGame:
         rw = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value]
         
         # Wrists above Nose
-        if lw.y < nose.y and rw.y < nose.y: score += 4
-        # Wrists close together
-        if self.calculate_distance(lw, rw) < 0.2: score += 4
+        if lw.y < nose.y and rw.y < nose.y: score += 2
+        # Wrists SIGNIFICANTLY above Nose (Full extension)
+        if lw.y < nose.y - 0.2 and rw.y < nose.y - 0.2: score += 2
+        # Wrists close together (Stricter)
+        if self.calculate_distance(lw, rw) < 0.15: score += 4
         # Arms visible
         if lw.visibility > 0.5 and rw.visibility > 0.5: score += 2
         
@@ -95,14 +170,21 @@ class MotionGame:
         
         # Check for one straight arm (>150 deg) and one bent arm (<90 deg)
         # Case A: Left Straight, Right Bent
-        if left_angle > 150 and right_angle < 90: score += 6
+        if left_angle > 160 and right_angle < 80: 
+            score += 4
+            # String Pull Check: Bent wrist near Bent shoulder
+            if self.calculate_distance(rw, rs) < 0.2: score += 3
+            
         # Case B: Right Straight, Left Bent
-        elif right_angle > 150 and left_angle < 90: score += 6
+        elif right_angle > 160 and left_angle < 80: 
+            score += 4
+            # String Pull Check: Bent wrist near Bent shoulder
+            if self.calculate_distance(lw, ls) < 0.2: score += 3
             
         # Check arm height (should be roughly shoulder level)
         if abs(lw.y - ls.y) < 0.2 or abs(rw.y - rs.y) < 0.2: score += 2
         # Feet should be somewhat apart (standing stance) - basic check
-        if ls.visibility > 0.5: score += 2 # Visibility bonus
+        if ls.visibility > 0.5: score += 1 # Visibility bonus
         
         return score
 
@@ -312,6 +394,9 @@ class MotionGame:
 def main():
     cap = cv2.VideoCapture(0)
     game = MotionGame()
+    
+    cv2.namedWindow('Motion Detection Game', cv2.WINDOW_NORMAL)
+    is_fullscreen = False
 
     if not cap.isOpened():
         print("Error: Could not open webcam.")
@@ -334,9 +419,12 @@ def main():
         if results.pose_landmarks:
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
             
-            if not game.game_over:
+            if game.game_started and not game.game_over:
                 logic_text, score_color = game.update(results.pose_landmarks.landmark)
                 status_text += f" | {logic_text}"
+            elif not game.game_started:
+                status_text = "Status: Waiting to Start..."
+                # Start logic is handled below in overlay section
             else:
                 status_text = f"GAME OVER! Score: {game.total_score} | Press 'r' to Retry"
                 score_color = (0, 0, 255)
@@ -346,7 +434,28 @@ def main():
         
         # Draw Total Score separate
         cv2.putText(frame, f"Total: {game.total_score}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 215, 0), 2, cv2.LINE_AA)
+        
+        # Start Screen Overlay
+        # Start Screen Overlay
+        if not game.game_started:
+            # If countdown active, show countdown
+            if game.countdown_active:
+                count_text = game.update_countdown()
+                cv2.putText(frame, count_text, (250, 250), cv2.FONT_HERSHEY_SIMPLEX, 4, (0, 0, 255), 10)
+            else:
+                # Use Hand Detector for Start Screen
+                hand_results = hands.process(image_rgb)
+                
+                cv2.putText(frame, "SHOW 2 FISTS TO START", (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 3)
+                cv2.putText(frame, "Press 'f' for Fullscreen", (50, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
+                if hand_results.multi_hand_landmarks:
+                    for hand_landmarks in hand_results.multi_hand_landmarks:
+                        mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                    
+                    if game.check_hands_start(hand_results):
+                        game.trigger_countdown()
+        
         cv2.imshow('Motion Detection Game', frame)
 
         key = cv2.waitKey(1) & 0xFF
@@ -354,6 +463,9 @@ def main():
             break
         elif key == ord('r') and game.game_over:
             game.reset_game()
+        elif key == ord('f'):
+            is_fullscreen = not is_fullscreen
+            cv2.setWindowProperty('Motion Detection Game', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN if is_fullscreen else cv2.WINDOW_NORMAL)
 
     cap.release()
     cv2.destroyAllWindows()
